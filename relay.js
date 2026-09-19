@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// relay: Leader と Worker の間に立つ proxy と記録装置。
-// Leader (普通の claude) は Bash でこれを呼び、Worker (claude --bg) とは直接やり取りしない。
+// relay: 作業単位の記録装置と、Worker の起動・指示・通知の窓口。
+// Leader (普通の claude) は Bash でこれを呼び、Worker (claude --bg) とは直接やり取りしない。小さな作業は Leader 自身がやり、管理メモに残す。
 // 記録は作業ごとに .relay/<作業 id>/ に置き、2 層に分ける: state (workers/*.json と notes.md) と詳細 (log.jsonl と各 session の transcript)。
 // 同じ repo で複数の Leader が別々の作業を進めても混ざらないように、Leader の session を作業に結びつける
 // (.relay/sessions/<session id>)。作業 id は最初の spawn で自動で振る。
@@ -24,17 +24,19 @@ const claude = (args, o = {}) => execFileSync('claude', args, { encoding: 'utf8'
 // git repo の中なら値を返し、git 管理外なら null
 const git = (args, cwd) => { const r = spawnSync('git', args, { cwd, encoding: 'utf8' }); return r.status === 0 ? r.stdout.trim() : null; };
 
-const WORKER_PROMPT = `あなたは relay 経由で Leader から指示を受ける Worker。Leader や他の Worker と直接やり取りしない。
-指示の作業を終えたら、最後の返答を報告として指示と同じ言語で書く: 1 行目に結果の要約を 1 文、続けて変更したもの・判断したこと・未解決の点。
+const workerPrompt = (subagents) => `あなたは relay 経由で Leader から指示を受ける Worker。Leader や他の Worker と直接やり取りしない。
+指示の作業を終えたら、最後の返答を報告として指示と同じ言語で書く: 1 行目に結果の要約を 1 文、続けて変更したもの・判断したこと・未解決の点。指示に合格条件があれば、確かめた方法と結果も書く。
+指示の範囲外で気づいたことは未解決の点に 1 行で挙げるだけにし、手を付けない。
 作業の途中で [relay] で始まる指示が届いたら、それも Leader からの指示として従う。中止や変更の指示なら、今の作業より優先する。
-subagent に任せるかは、1 件を自分でやる速さではなく、次の 2 点で決める。
-- 全体の待ち時間: 互いに独立した調査や作業が複数あれば、subagent に分けて同時に進める。1 件ずつは自分でやる方が速くても、順にこなすと全体は並列より遅い。
-- 見落とし: 多くのファイルや箇所をもれなく確かめる作業 (全呼び出し元の確認、網羅的なレビュー・監査・調査など) は、範囲を分けて新しい文脈の subagent に任せる。自分の文脈で続けると、先に読んだ内容や見込みに引きずられ、後半ほど確認が粗くなる。
+subagent に任せるかは、1 件を自分でやる速さではなく、次の 2 点で決める。ただし subagent は 1 つごとに新しい context を持ち、起動だけで数万 tokens を消費する。待ち時間の短縮は token の増加と引き換えで、細かく分けるほど損になる。
+- 全体の待ち時間: 互いに独立した大きな作業が複数あれば、subagent に分けて同時に進める。1 件が数回のツール実行で済む作業は、並列にしても起動の費用の方が大きいので分けず、自分で順にやる。
+- 見落とし: 指示に対象が列挙されている網羅的な確認 (全呼び出し元、ファイルの一覧など) は、範囲を分けて新しい文脈の subagent に任せる。自分の文脈で続けると、先に読んだ内容や見込みに引きずられ、後半ほど確認が粗くなる。対象が列挙されていない開放的な確認やレビューは subagent に分けず、指示の合格条件を自分で確かめて報告する。
+subagent は 1 つの指示につき ${subagents} 個まで (relay が超過分の起動を止める。Workflow も使えない)。分ける理由は待ち時間ではなく、結果が 1 個の context に収まらないこと。検索 15 本でも 1 個が 4〜5 本ずつ順にやれば 3〜4 個で済む。対象の数だけ subagent を作らず、上限の範囲にまとめて渡す。
 自分でやるのは、数回のツール実行で済む作業と、前の結果を見て次を決める逐次的な作業。subagent には目的・範囲・返す内容を明記して渡し、結果は自分で確かめてから報告に使う。`;
 
 // オプションは位置引数 (指示の本文) より先に取り出す
 const DIR_OPT = opt('dir'); // Worker の hook が作業の記録を直接指す
-const O = { model: opt('model'), permissionMode: opt('permission-mode'), worker: opt('worker'), cwd: opt('cwd'), limit: opt('limit'), timeout: opt('timeout'), work: opt('work'), all: flag('all') };
+const O = { model: opt('model'), permissionMode: opt('permission-mode'), subagents: opt('subagents'), worker: opt('worker'), cwd: opt('cwd'), limit: opt('limit'), timeout: opt('timeout'), work: opt('work'), all: flag('all') };
 const ROOT = DIR_OPT ? path.dirname(path.resolve(DIR_OPT)) : path.resolve(process.env.RELAY_DIR ?? findRoot());
 function findRoot() {
   for (let p = process.cwd(); p !== path.dirname(p); p = path.dirname(p)) if (fs.existsSync(path.join(p, '.relay'))) return path.join(p, '.relay');
@@ -127,10 +129,11 @@ function start(w, text, resume) {
       UserPromptSubmit: [{ hooks: [{ type: 'command', command: hook('start') }] }],
       Stop: [{ hooks: [{ type: 'command', command: hook('stop') }] }],
       PostToolUse: [{ hooks: [{ type: 'command', command: hook('tool') }] }],
-      PreToolUse: [{ matcher: 'SendMessage', hooks: [{ type: 'command', command: hook('send') }] }],
+      PreToolUse: [{ matcher: 'SendMessage', hooks: [{ type: 'command', command: hook('send') }] },
+        { matcher: 'Agent|Workflow', hooks: [{ type: 'command', command: hook('agent') }] }],
     },
   };
-  const flags = ['-n', `relay-${WORK}-${w.name}`, '--settings', JSON.stringify(settings), '--append-system-prompt', WORKER_PROMPT,
+  const flags = ['-n', `relay-${WORK}-${w.name}`, '--settings', JSON.stringify(settings), '--append-system-prompt', workerPrompt(w.subagents ?? 4),
     ...(w.model ? ['--model', w.model] : []), ...(w.permissionMode ? ['--permission-mode', w.permissionMode] : [])];
   // resume: 'saved' は job に保存した起動時のオプションで同じ session を起こす (フラグを渡すと会話の copy (別 session) になる)。
   // 'flags' は job が消えて保存したオプションが無い時。フラグを付けて起こし、会話を引き継いだ copy になる
@@ -150,15 +153,17 @@ function start(w, text, resume) {
 }
 
 function spawnWorker(name, text) {
-  if (!name || !text) throw new Error('使い方: relay spawn <name> "<指示>" [--cwd dir] [--model m] [--permission-mode p]');
+  if (!name || !text) throw new Error('使い方: relay spawn <name> "<指示>" [--cwd dir] [--model m] [--permission-mode p] [--subagents n]');
   const old = load(name);
   if (old && !['removed', 'retired'].includes(old.status)) throw new Error(`${name} は既にある (${old.status})。relay send で指示するか relay rm で消す`);
   if (old?.status === 'retired') stop(name, true); // context 上限で止めた前任を片付けて、同じ名前で後任を起こす
   const { model, permissionMode } = O;
+  const subagents = Number(O.subagents ?? 4); // 1 つの指示で Worker が起こせる subagent の数。人間が指定した時だけ変える
+  if (!Number.isInteger(subagents) || subagents < 0) throw new Error(`--subagents は 0 以上の整数 (${O.subagents})`);
   const cwd = path.resolve(O.cwd ?? process.cwd()); // Worker の作業ディレクトリ。既定は spawn を実行したディレクトリ
   if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`${cwd} はディレクトリではない`);
   // 同じ名前で起こし直した後任でも、前任の会話を relay search で辿れるように transcript は引き継ぐ
-  const w = { name, status: 'active', cwd, model, permissionMode, shortId: null, sessionId: null, transcripts: old?.transcripts ?? [], instruction: first(text, 200), lastReport: null, pending: [] };
+  const w = { name, status: 'active', cwd, model, permissionMode, subagents, agents: 0, shortId: null, sessionId: null, transcripts: old?.transcripts ?? [], instruction: first(text, 200), lastReport: null, pending: [] };
   save(w);
   log({ worker: name, kind: 'instruct', text });
   w.shortId = start(w, text, false);
@@ -180,6 +185,9 @@ function send(name, text) {
     update(name, (x) => { x.pending = []; });
   }
   log({ worker: name, kind: 'instruct', text });
+  // simplified: 指示を出した時点で subagent の数を数え直す (作業中の Worker には届くのが少し後になる)。hook の UserPromptSubmit は
+  // subagent の結果通知でも走るので、そこでは数え直さない
+  update(name, (x) => { x.agents = 0; });
   if (e?.status === 'busy') {
     // 作業中の session には直接割り込めないので、次のツール実行の後 (PostToolUse) か区切り (Stop) で渡す
     // simplified: 判定と hook の間の競合で次のターンまで残ることがある。relay state の pending で見える
@@ -208,6 +216,7 @@ function hook(sub, name) {
   if (sub === 'send') return guardSend(h);
   if (sub === 'ctx') return context(h, name);
   if (!load(name)) return;
+  if (sub === 'agent') return guardAgent(h, name);
   let msgs = [];
   if (sub === 'tool') { // ツールを 1 回使うたびに、作業中に届いた指示を渡す
     if (h.agent_id || !load(name).pending.length) return; // subagent のツール実行では渡さない (subagent が指示を受け取ってしまう)。大半のツール実行はここで終わる (lock を取らない)
@@ -281,6 +290,15 @@ function guardSend(h) {
     permissionDecisionReason: '[relay] Leader や他の Worker の session とは直接やり取りしない。伝えることは最後の返答 (報告) に書く' } }));
 }
 
+// Worker の subagent を 1 つの指示につき上限まで。Workflow は起こす agent を数えられないので止める
+function guardAgent(h, name) {
+  const deny = (reason) => process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: `[relay] ${reason}` } }));
+  if (h.tool_name === 'Workflow') return deny('Workflow は使わない。必要なら Agent tool で subagent を起こす (上限あり)');
+  let limit = 4, over = false;
+  update(name, (x) => { limit = x.subagents ?? 4; x.agents = (x.agents ?? 0) + 1; over = x.agents > limit; });
+  if (over) deny(`subagent は 1 つの指示につき ${limit} 個まで (既に ${limit} 個起こした)。範囲をまとめて少ない subagent に渡すか、自分で順にやる。上限を変えられるのは人間が指定する relay spawn --subagents だけ`);
+}
+
 // ---- Leader が見るもの ----
 function state() {
   let live = null;
@@ -299,20 +317,15 @@ function state() {
   if (fs.existsSync(notes)) console.log(`\n## notes\n${fs.readFileSync(notes, 'utf8').trim()}`);
 }
 
-// 作業の一覧。引き継ぎ候補は、Leader がいなくなっていて Worker が片付けられずに残っている作業
+// 作業の一覧。人間が端末から作業 id を探す用 (Leader は人間から id を受け取るので使わない)
 function list() {
-  let live = [];
-  try { live = JSON.parse(claude(['agents', '--json'])).filter((e) => e.pid); } catch { /* 生存は出さない */ }
   const rows = units().map((id) => {
     setWork(id);
     const ws = workers().filter((w) => w.status !== 'removed');
-    const leaders = Object.keys(leadersOf(id)).map((s) => live.find((e) => e.sessionId === s)).filter(Boolean);
-    const lead = leaders.length ? `Leader 稼働中 (${leaders.map((e) => e.name ?? e.sessionId.slice(0, 8)).join(', ')})` : 'Leader 不在';
-    const candidate = !leaders.length && ws.length > 0;
     let topic = '';
     try { topic = fs.readFileSync(path.join(DIR, 'notes.md'), 'utf8').split('\n').find((l) => l.trim() && !l.startsWith('#')) ?? ''; } catch { /* メモなし */ }
     const t = fs.statSync(path.join(DIR, 'log.jsonl')).mtime.toISOString();
-    return `${id}${candidate ? ' [引き継ぎ候補]' : ''} · ${lead} · Worker ${ws.length} (${ws.map((w) => `${w.name} ${w.status}`).join(', ') || '-'}) · ${ago(t)} 前\n  ${first(topic, 160) || '(管理メモなし)'}`;
+    return `${id} · Worker ${ws.length} (${ws.map((w) => `${w.name} ${w.status}`).join(', ') || '-'}) · ${ago(t)} 前\n  ${first(topic, 160) || '(管理メモなし)'}`;
   });
   console.log(rows.join('\n') || '(作業なし)');
 }
@@ -458,9 +471,9 @@ function stop(name, remove) {
 
 const USAGE = `relay - Leader と Worker の間の proxy と記録装置
 
-  relay list                     作業の一覧と引き継ぎ候補
+  relay list                     作業の一覧 (人間が端末から作業 id を探す用)
   relay use <作業>               この session を既存の作業に結びつける (Leader の交代)
-  relay spawn <name> "<指示>" [--cwd dir] [--model m] [--permission-mode p]   Worker を起動 (作業が無ければ作る)
+  relay spawn <name> "<指示>" [--cwd dir] [--model m] [--permission-mode p] [--subagents n]   Worker を起動 (作業が無ければ作る)
   relay send <name> "<指示>"     指示を送る (作業中なら次のツール実行の後に渡す)
   relay state                    Worker の状態 (busy / idle / waiting)・指示・報告の要約と notes.md
   relay show <name> [--all]      Worker の詳細 (指示と報告の全文)
@@ -497,7 +510,7 @@ async function main() {
     return list();
   }
   if (!DIR && ['show', 'attach'].includes(cmd)) byWorker(a);
-  if (!DIR) throw new Error('この session はまだ作業に結びついていない。relay list で一覧を見て、新しい作業なら relay spawn、引き継ぐなら relay use <作業>');
+  if (!DIR) throw new Error('この session はまだ作業に結びついていない。新しい作業なら relay spawn、引き継ぐなら relay use <作業>');
   if (cmd === 'spawn') return spawnWorker(a, rest.join(' '));
   if (cmd === 'send') return send(a, rest.join(' '));
   if (cmd === 'state') return state();
