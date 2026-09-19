@@ -102,14 +102,16 @@ function bind(id) {
 
 // 動いている bg session (id → claude agents の項目。status は idle / busy / waiting、waitingFor は待っているもの)
 const agents = () => new Map(JSON.parse(claude(['agents', '--json'])).filter((e) => e.pid).map((e) => [e.id, e]));
-const aliveIds = () => new Set(agents().keys());
 // 動いている session を --resume すると copy ができるので、止めてから再開する。
-// claude stop の後もプロセスはしばらく終了処理を続け、その間の --resume は copy になるので、プロセスが消えるまで待つ
+// claude stop の後もプロセスはしばらく終了処理を続け、その間の --resume は copy になるので、プロセスが消えるまで待つ。
+// 止められなかった時は投げる (止まっていない Worker を stopped と記録しない)
 function stopAndWait(id) {
   const pid = JSON.parse(claude(['agents', '--json'])).find((e) => e.id === id)?.pid;
+  if (!pid) return; // 動いていない
   claude(['stop', id]);
   const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
-  for (let i = 0; pid && i < 60 && alive(); i++) spawnSync('sleep', ['0.5']);
+  for (let i = 0; i < 60 && alive(); i++) spawnSync('sleep', ['0.5']);
+  if (alive()) throw new Error(`session ${id} が 30 秒経っても終了しない`);
 }
 
 // ---- Worker の起動 ----
@@ -152,7 +154,7 @@ function spawnWorker(name, text) {
   const cwd = path.resolve(O.cwd ?? process.cwd()); // Worker の作業ディレクトリ。既定は spawn を実行したディレクトリ
   if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`${cwd} はディレクトリではない`);
   // 同じ名前で起こし直した後任でも、前任の会話を relay search で辿れるように transcript は引き継ぐ
-  const w = { name, status: 'working', cwd, model, permissionMode, shortId: null, sessionId: null, transcripts: old?.transcripts ?? [], instruction: first(text, 200), lastReport: null, pending: [] };
+  const w = { name, status: 'active', cwd, model, permissionMode, shortId: null, sessionId: null, transcripts: old?.transcripts ?? [], instruction: first(text, 200), lastReport: null, pending: [] };
   save(w);
   log({ worker: name, kind: 'instruct', text });
   w.shortId = start(w, text, false);
@@ -166,20 +168,22 @@ function send(name, text) {
   if (!w || w.status === 'removed') throw new Error(`${name} は無い`);
   if (!text) throw new Error('使い方: relay send <name> "<指示>"');
   log({ worker: name, kind: 'instruct', text });
-  const alive = aliveIds().has(w.shortId);
-  if (alive && load(name).status === 'working') {
+  const e = agents().get(w.shortId), alive = !!e;
+  if (e?.status === 'busy') {
     // 作業中の session には直接割り込めないので、次のツール実行の後 (PostToolUse) か区切り (Stop) で渡す
     // simplified: 判定と hook の間の競合で次のターンまで残ることがある。relay state の pending で見える
     update(name, (x) => { x.pending.push(text); x.instruction = first(text, 200); });
     return console.log(`${name} は作業中。次のツール実行の後に渡す (pending ${load(name).pending.length})。今すぐ止めるなら relay stop の後に relay send`);
   }
+  // simplified: idle でも subagent や background の結果を待っていることがあり、止めて再開するとその待ちは切れる。
+  // 待っているかは直前の報告に出るので、送るか待つかは Leader が決める
   // hook が一度も走らずに止まった session でも、一覧から session id を引ける
   const job = JSON.parse(claude(['agents', '--json', '--all'])).find((e) => e.id === w.shortId);
   w.sessionId ??= job?.sessionId;
   if (!w.sessionId) throw new Error(`${name} の session id が分からない。起動直後なら少し待つ`);
   if (alive) stopAndWait(w.shortId);
   const old = w.shortId;
-  update(name, (x) => { x.status = 'working'; x.instruction = first(text, 200); x.sessionId = w.sessionId; });
+  update(name, (x) => { x.status = 'active'; x.instruction = first(text, 200); x.sessionId = w.sessionId; });
   const id = start(w, text, job ? 'saved' : 'flags');
   update(name, (x) => { x.shortId = id; });
   if (old && old !== id) try { claude(['rm', old]); } catch { /* 既に無い */ }
@@ -204,19 +208,18 @@ function hook(sub, name) {
     x.sessionId = h.session_id ?? x.sessionId;
     if (h.transcript_path && !x.transcripts.includes(h.transcript_path)) x.transcripts.push(h.transcript_path);
   };
-  if (sub === 'start') return update(name, (x) => { seen(x); x.status = 'working'; });
-  // background の処理 (subagent など) の結果を待っている区切りは報告にしない。終わるともう 1 ターン来る
-  if (h.background_tasks?.length || awaiting(h.transcript_path)) return update(name, seen);
+  if (sub === 'start') return update(name, seen);
+  // 区切りの返答はすべて報告にする。作業が終わったかどうかは判定しない (Worker が subagent や background の結果を
+  // 待っていればその旨の報告になり、結果が届くとまた区切りが来る)。Leader が報告を読んで決める
   const report = h.last_assistant_message ?? '';
   const w = update(name, (x) => {
     seen(x);
     msgs = x.pending.splice(0);
     if (msgs.length) return; // ツールを使わずに区切りまで来た時は、止めずにここで渡す
-    x.status = 'idle';
     x.lastReport = first(report.split('\n').find((l) => /[\p{L}\p{N}]/u.test(l)), 200); // 文字を含む最初の行 (区切り線などを飛ばす)
   });
   if (msgs.length) return process.stdout.write(JSON.stringify({ decision: 'block', reason: relayMsg(msgs) }));
-  log({ worker: name, kind: 'report', text: report, session: w.sessionId, line: `${name} idle: ${first(report, 140)}` });
+  log({ worker: name, kind: 'report', text: report, session: w.sessionId, line: `${name} 報告: ${first(report, 140)}` });
 }
 
 // statusLine から context の使用率を受け取って記録する。CTX_LIMIT % に達したら Leader に relay wait で知らせる (1 回だけ)。
@@ -235,18 +238,6 @@ function context(h, name) {
   if (warn) log({ worker: name, kind: 'context', text: `${pct}%`, line: `${name} context ${pct}%` });
 }
 
-// Worker が何かの完了を待っているか (subagent の起動・再開、background のコマンド) を transcript から見る。
-// SendMessage で再開した subagent は Stop hook の background_tasks に出ない。transcript は Claude Code の内部形式で、
-// 起動時の id (agentId: / resumedAgentId / Command running in background with ID:) と完了通知の <task-id> が対応する
-function awaiting(tp) {
-  let text; try { text = fs.readFileSync(tp, 'utf8'); } catch { return false; }
-  const open = new Set();
-  for (const m of text.matchAll(/agentId\\?":\\?"([0-9a-z]+)|agentId: ([0-9a-z]+)|background with ID: ([0-9a-z]+)|<task-id>([0-9a-z]+)<\/task-id>/g)) {
-    const id = m[1] ?? m[2] ?? m[3];
-    if (id) open.add(id); else open.delete(m[4]);
-  }
-  return open.size > 0;
-}
 // 最後のツール実行 (何を待っているのかを Leader に伝える。Bash の timeout は、正常な長時間実行を待つのにも使う)
 function lastTool(tp) {
   let lines; try { lines = fs.readFileSync(tp, 'utf8').split('\n'); } catch { return {}; }
@@ -258,19 +249,6 @@ function lastTool(tp) {
     if (t) return { text: first(`${t.name} ${t.input?.command ?? t.input?.description ?? t.input?.file_path ?? ''}`, 100), timeout: Number(t.input?.timeout) || 0 };
   }
   return {};
-}
-
-// Stop hook が走らなかった時に、報告として拾う最後の返答
-function lastText(tp) {
-  let lines; try { lines = fs.readFileSync(tp, 'utf8').split('\n'); } catch { return ''; }
-  for (const line of lines.reverse()) {
-    if (!line.includes('"assistant"')) continue;
-    let m; try { m = JSON.parse(line); } catch { continue; }
-    if (m.isSidechain || m.type !== 'assistant') continue;
-    const text = (m.message?.content ?? []).filter((x) => x.type === 'text').map((x) => x.text).join('\n').trim();
-    if (text) return text;
-  }
-  return '';
 }
 
 // Worker の SendMessage の宛先が他の session (claude agents に出るもの) なら止める。subagent 宛ては通す
@@ -291,10 +269,10 @@ function state() {
   const ws = workers().filter((w) => w.status !== 'removed');
   const lines = ws.map((w) => {
     const e = live?.get(w.shortId);
-    const note = !live || w.status !== 'working' ? ''
-      : !e ? ' (session が無い: 落ちた可能性。relay send で再開)'
-      : e.status === 'waiting' ? ` (待ち: ${e.waitingFor ?? '?'}。relay attach ${w.name} で応答)` : '';
-    return `${w.name} ${w.status}${note}${w.pending.length ? ` pending ${w.pending.length}` : ''}${w.ctx == null ? '' : ` · context ${w.ctx}%`} · ${ago(w.updatedAt)} 前\n  指示: ${w.instruction}\n  報告: ${w.lastReport ?? '-'}`;
+    const st = w.status !== 'active' ? w.status : !live ? '?'
+      : !e ? 'session が無い (落ちた可能性。relay send で再開)'
+      : e.status === 'waiting' ? `waiting: ${e.waitingFor ?? '?'} (relay attach ${w.name} で応答)` : e.status;
+    return `${w.name} ${st}${w.pending.length ? ` pending ${w.pending.length}` : ''}${w.ctx == null ? '' : ` · context ${w.ctx}%`} · ${ago(w.updatedAt)} 前\n  指示: ${w.instruction}\n  報告: ${w.lastReport ?? '-'}`;
   });
   const notes = path.join(DIR, 'notes.md');
   console.log(`作業 ${WORK} (管理メモ ${path.relative(process.cwd(), notes)})\n\n${lines.join('\n') || '(Worker なし)'}`);
@@ -403,10 +381,10 @@ async function wait() {
   console.log('(変化なし)');
 }
 // Worker の最後の動き。relay 自身の書き込み (updatedAt) では進んだことにならないので、transcript が伸びた時刻を見る
-// 前面のコマンドは既定 120 秒で background に移される (Worker は作業を続ける) ので、2 分 30 秒の無反応は background の
-// 処理や subagent が終わらない状態を示す。Bash に長い timeout を指定した実行は正常なので、その分は待つ。
-// 正当に時間が掛かっているのかは外から見分けられないので、知らせるだけで止めるかどうかは Leader が決める。
-// 待たせ続けないよう、止まったままなら同じ間隔で知らせ直す
+// 前面のコマンドは既定 120 秒で background に移される (Worker は作業を続ける) ので、指示の後に報告が無いまま 2 分 30 秒
+// 動きが無ければ、background の処理や subagent が終わらない状態を示す。Bash に長い timeout を指定した実行は正常なので、
+// その分は待つ。正当に時間が掛かっているのかは外から見分けられないので、知らせるだけで止めるかどうかは Leader が決める。
+// 待たせ続けないよう、止まったままなら同じ間隔で知らせ直す。報告の後の無反応は知らせない (待っているなら報告に書いてある)
 const STALL = 150000;
 function activityAt(w) {
   try { return new Date(fs.statSync(w.transcripts.at(-1)).mtimeMs).toISOString(); } catch { return w.updatedAt; } // transcript が出る前は起動時刻
@@ -420,8 +398,10 @@ function stalled(w, tool) {
 function checkWorkers() {
   let live;
   try { live = agents(); } catch { return; }
+  const entries = readLog();
+  const unreported = (w) => entries.findLast((e) => e.worker === w.name && ['instruct', 'report'].includes(e.kind))?.kind === 'instruct';
   for (const w of workers()) {
-    if (w.status !== 'working') continue;
+    if (w.status !== 'active') continue;
     const e = live.get(w.shortId);
     if (!e) {
       if (Date.now() - Date.parse(w.updatedAt) < 60000) continue; // 起動直後・supervisor の再起動待ち
@@ -430,21 +410,13 @@ function checkWorkers() {
     } else if (e.status === 'waiting' && w.waitingFor !== e.waitingFor) { // 同じ待ちは 1 回だけ知らせる
       update(w.name, (x) => { x.waitingFor = e.waitingFor; });
       log({ worker: w.name, kind: 'waiting', text: e.waitingFor ?? '', line: `${w.name} waiting: ${e.waitingFor ?? '?'} (relay attach ${w.name} で応答)` });
-    } else if (e.status === 'idle' && !awaiting(w.transcripts.at(-1))) {
-      // Stop hook が走らずに終わった Worker を拾う保険。Leader が報告を待ち続けないよう、記録から報告を作る
-      if (!w.idleSince) { update(w.name, (x) => { x.idleSince = now(); }); continue; }
-      if (Date.now() - Date.parse(w.idleSince) < 20000) continue;
-      const report = lastText(w.transcripts.at(-1));
-      update(w.name, (x) => { x.status = 'idle'; x.lastReport = first(report, 200) || '(返答なし)'; delete x.idleSince; delete x.waitingFor; delete x.stalledAt; });
-      log({ worker: w.name, kind: 'report', text: report, session: w.sessionId, line: `${w.name} idle: ${first(report, 140) || '(返答なし)'} (Stop hook が走らなかったので記録から拾った)` });
-    } else if (stalled(w, lastTool(w.transcripts.at(-1)))) { // 進んでいない Worker を知らせる (止めるかどうかは Leader が決める)
+    } else if (unreported(w) && stalled(w, lastTool(w.transcripts.at(-1)))) { // 進んでいない Worker を知らせる (止めるかどうかは Leader が決める)
       const t = lastTool(w.transcripts.at(-1)).text;
       update(w.name, (x) => { x.stalledAt = now(); });
       log({ worker: w.name, kind: 'stalled', text: t ?? '', line: `${w.name} 反応なし ${ago(activityAt(w))}: 最後のツール実行は ${t || '不明'}`
         + ` (relay show ${w.name} で確認。問い合わせるなら relay stop の後に relay send)` });
     } else {
       if (w.waitingFor) update(w.name, (x) => { delete x.waitingFor; });
-      if (w.idleSince) update(w.name, (x) => { delete x.idleSince; });
       if (w.stalledAt && Date.parse(activityAt(w)) > Date.parse(w.stalledAt)) update(w.name, (x) => { delete x.stalledAt; }); // また動き出した
     }
   }
@@ -453,7 +425,7 @@ function checkWorkers() {
 function stop(name, remove) {
   const w = load(name);
   if (!w) throw new Error(`${name} は無い`);
-  try { stopAndWait(w.shortId); } catch { /* 既に止まっている */ } // 直後の send で copy にならないよう終了まで待つ
+  stopAndWait(w.shortId); // 直後の send で copy にならないよう終了まで待つ
   if (remove) try { claude(['rm', w.shortId]); } catch { /* 既に無い */ }
   const status = remove ? 'removed' : 'stopped';
   update(name, (x) => { x.status = status; });
@@ -467,7 +439,7 @@ const USAGE = `relay - Leader と Worker の間の proxy と記録装置
   relay use <作業>               この session を既存の作業に結びつける (Leader の交代)
   relay spawn <name> "<指示>" [--cwd dir] [--model m] [--permission-mode p]   Worker を起動 (作業が無ければ作る)
   relay send <name> "<指示>"     指示を送る (作業中なら次のツール実行の後に渡す)
-  relay state                    Worker の状態・指示・報告の要約と notes.md
+  relay state                    Worker の状態 (busy / idle / waiting)・指示・報告の要約と notes.md
   relay show <name> [--all]      Worker の詳細 (指示と報告の全文)
   relay search <語> [--worker n] 詳細記録を検索 (指示・報告・Worker と Leader の会話)
   relay wait [--timeout 秒]      新しい報告か異常まで待って 1 行ずつ出す (background で使う)

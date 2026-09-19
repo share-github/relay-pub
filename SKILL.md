@@ -31,8 +31,8 @@ description: この session を relay の Leader にする。作業は Worker (�
 | `relay list` | 作業の一覧と引き継ぎ候補 |
 | `relay use <作業>` | この session を既存の作業に結びつける (人間が引き継ぎを承認した時だけ) |
 | `relay spawn <name> "<指示>" [--cwd dir] [--model m] [--permission-mode p]` | Worker を起動する。人間が model や権限モードを指定していれば、後任を含めて毎回付ける |
-| `relay send <name> "<指示>"` | 次の指示・追加・変更・中止の指示。作業中なら、Worker が次にツールを使い終えた時に渡る (1 回のツール実行が長いとその間は待つ)。今すぐ止めるなら `relay stop <name>` の後に `relay send` で指示する (同じ session で文脈を保ったまま再開する) |
-| `relay state` | この作業の全 Worker の状態・今の指示・直近の報告の要約と、管理メモ。普段はこれだけ見る |
+| `relay send <name> "<指示>"` | 次の指示・追加・変更・中止の指示。作業中 (busy) なら、Worker が次にツールを使い終えた時に渡る (1 回のツール実行が長いとその間は待つ)。止まっている (idle) なら、止めて同じ session で再開する。subagent や background の結果を待って idle になっている Worker に送ると、その待ちは切れる (直前の報告に待っていると書いてあれば、結果の報告を待ってから送る)。今すぐ止めるなら `relay stop <name>` の後に `relay send` で指示する |
+| `relay state` | この作業の全 Worker の状態 (busy / idle / waiting)・今の指示・直近の報告の要約と、管理メモ。普段はこれだけ見る |
 | `relay show <name> [--all]` | その Worker への指示と報告の全文 |
 | `relay search <語> [--worker <name>]` | この作業の詳細記録 (指示・報告・Worker と歴代 Leader の会話) を検索 |
 | `relay wait` | **background で実行する** (`run_in_background`)。この作業の Worker の報告や異常が 1 行で届いたら終わるので、確認したらまた background で起動する |
@@ -45,11 +45,12 @@ description: この session を relay の Leader にする。作業は Worker (�
 - Worker は `relay spawn` を実行したディレクトリで作業する。別のディレクトリで作業させるなら `--cwd <dir>` を付ける。
 - 記録の `.relay/` は git repo の中なら repo の root に置かれ、relay が `.git/info/exclude` に足すので git status に出ない。
 
-`relay wait` が出す行: `<name> idle: <報告の先頭>` (作業が終わった)、`<name> dead: …` (session が消えた。`relay send` で再開)、
+`relay wait` が出す行: `<name> 報告: <報告の先頭>` (Worker の返答が区切りまで来た。作業が終わったとは限らない。subagent や
+background の結果を待っている時はその旨の報告になり、結果が届くとまた報告が来る)、`<name> dead: …` (session が消えた。`relay send` で再開)、
 `<name> waiting: permission prompt …` (権限の確認で止まっている。人間に `relay attach <name>` で応答してもらう)、
 `<name> context N%` (Worker の context の使用量が 70% に達した。Worker は作業を続けている)、
-`<name> 反応なし …` (2 分 30 秒以上、会話記録が伸びていない。background のコマンドや subagent が終わらない可能性。
-止まったままなら 2 分 30 秒ごとに知らせ直す)。
+`<name> 反応なし …` (指示の後に報告が無いまま 2 分 30 秒以上、会話記録が伸びていない。background のコマンドや subagent が
+終わらない可能性。止まったままなら 2 分 30 秒ごとに知らせ直す)。
 
 ## 反応が無い Worker
 
