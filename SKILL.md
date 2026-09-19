@@ -30,7 +30,7 @@ description: この session を relay の Leader にする。作業は Worker (�
 |---|---|
 | `relay list` | 作業の一覧と引き継ぎ候補 |
 | `relay use <作業>` | この session を既存の作業に結びつける (人間が引き継ぎを承認した時だけ) |
-| `relay spawn <name> "<指示>" [--model m] [--permission-mode p]` | Worker を起動する。人間が model や権限モードを指定していれば、後任を含めて毎回付ける |
+| `relay spawn <name> "<指示>" [--cwd dir] [--model m] [--permission-mode p]` | Worker を起動する。人間が model や権限モードを指定していれば、後任を含めて毎回付ける |
 | `relay send <name> "<指示>"` | 次の指示・追加・変更・中止の指示。作業中なら、Worker が次にツールを使い終えた時に渡る (1 回のツール実行が長いとその間は待つ)。今すぐ止めるなら `relay stop <name>` の後に `relay send` で指示する (同じ session で文脈を保ったまま再開する) |
 | `relay state` | この作業の全 Worker の状態・今の指示・直近の報告の要約と、管理メモ。普段はこれだけ見る |
 | `relay show <name> [--all]` | その Worker への指示と報告の全文 |
@@ -42,13 +42,12 @@ description: この session を relay の Leader にする。作業は Worker (�
 
 ## Worker の作業場所
 
-- Worker は repo の作業ツリーで作業する。Leader と全 Worker が同じファイルを見るので、未 commit の変更も互いに見える。
-- 同時に動かす Worker には同じファイルを編集させない (互いの変更を上書きする)。branch の切り替えや commit も全員に及ぶ。
-- `.relay/` は relay が `.git/info/exclude` に足すので、git status に出ない。
+- Worker は `relay spawn` を実行したディレクトリで作業する。別のディレクトリで作業させるなら `--cwd <dir>` を付ける。
+- 記録の `.relay/` は git repo の中なら repo の root に置かれ、relay が `.git/info/exclude` に足すので git status に出ない。
 
 `relay wait` が出す行: `<name> idle: <報告の先頭>` (作業が終わった)、`<name> dead: …` (session が消えた。`relay send` で再開)、
 `<name> waiting: permission prompt …` (権限の確認で止まっている。人間に `relay attach <name>` で応答してもらう)、
-`<name> context N%: …` (Worker の context の使用量が 70% に達した。Worker は区切りで引き継ぎに要ることを報告して止まる)、
+`<name> context N%` (Worker の context の使用量が 70% に達した。Worker は作業を続けている)、
 `<name> 反応なし …` (2 分 30 秒以上、会話記録が伸びていない。background のコマンドや subagent が終わらない可能性。
 止まったままなら 2 分 30 秒ごとに知らせ直す)。
 
@@ -62,9 +61,9 @@ description: この session を relay の Leader にする。作業は Worker (�
 ## Worker の context
 
 context が膨らんだ Worker は、要約 (compact) の上で作業を続けて質が落ちる。`relay state` に各 Worker の使用量が出る。
-`context N%` の通知が来たら、その Worker の報告を待ち、残りの作業を後任の Worker に引き継がせる
-(前任を `relay stop` し、後任を `relay spawn` して、前任の報告・判断を渡す。前任の記録は `relay search` で辿れる)。
-残りがごく少ないなら、そのまま仕上げさせてもよい。新しい作業は、長く使った Worker に `relay send` するより、新しい Worker に任せる。
+`context N%` の通知が来たら、その Worker に仕上げさせるか、後任の Worker に引き継がせるかを決める。
+引き継がせるなら、区切りで進み具合・判断したこと・残りの作業を報告させ、前任を `relay stop` し、後任を `relay spawn` して
+前任の報告・判断を渡す (前任の記録は `relay search` で辿れる)。新しい作業は、長く使った Worker に `relay send` するより、新しい Worker に任せる。
 
 ## 管理メモ
 

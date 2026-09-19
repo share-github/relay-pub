@@ -21,7 +21,8 @@ const PARENT_ENV = ['CLAUDECODE', 'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_MESSAGI
   'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_SSE_PORT', 'CLAUDE_PID', 'CLAUDE_EFFORT'];
 const cleanEnv = () => { const e = { ...process.env }; for (const k of PARENT_ENV) delete e[k]; return e; };
 const claude = (args, o = {}) => execFileSync('claude', args, { encoding: 'utf8', env: cleanEnv(), ...o });
-const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+// git repo の中なら値を返し、git 管理外なら null
+const git = (args, cwd) => { const r = spawnSync('git', args, { cwd, encoding: 'utf8' }); return r.status === 0 ? r.stdout.trim() : null; };
 
 const WORKER_PROMPT = `あなたは relay 経由で Leader から指示を受ける Worker。Leader や他の Worker と直接やり取りしない。
 指示の作業を終えたら、最後の返答を報告として指示と同じ言語で書く: 1 行目に結果の要約を 1 文、続けて変更したもの・判断したこと・未解決の点。
@@ -33,11 +34,11 @@ subagent に任せるかは、1 件を自分でやる速さではなく、次の
 
 // オプションは位置引数 (指示の本文) より先に取り出す
 const DIR_OPT = opt('dir'); // Worker の hook が作業の記録を直接指す
-const O = { model: opt('model'), permissionMode: opt('permission-mode'), worker: opt('worker'), limit: opt('limit'), timeout: opt('timeout'), work: opt('work'), all: flag('all') };
+const O = { model: opt('model'), permissionMode: opt('permission-mode'), worker: opt('worker'), cwd: opt('cwd'), limit: opt('limit'), timeout: opt('timeout'), work: opt('work'), all: flag('all') };
 const ROOT = DIR_OPT ? path.dirname(path.resolve(DIR_OPT)) : path.resolve(process.env.RELAY_DIR ?? findRoot());
 function findRoot() {
   for (let p = process.cwd(); p !== path.dirname(p); p = path.dirname(p)) if (fs.existsSync(path.join(p, '.relay'))) return path.join(p, '.relay');
-  return path.join(git(['rev-parse', '--show-toplevel'], process.cwd()), '.relay');
+  return path.join(git(['rev-parse', '--show-toplevel'], process.cwd()) ?? process.cwd(), '.relay'); // git 管理外なら今のディレクトリに置く
 }
 const SID = process.env.CLAUDE_CODE_SESSION_ID;
 const sessionFile = () => path.join(ROOT, 'sessions', SID);
@@ -144,11 +145,12 @@ function start(w, text, resume) {
 }
 
 function spawnWorker(name, text) {
-  if (!name || !text) throw new Error('使い方: relay spawn <name> "<指示>" [--model m] [--permission-mode p]');
+  if (!name || !text) throw new Error('使い方: relay spawn <name> "<指示>" [--cwd dir] [--model m] [--permission-mode p]');
   const old = load(name);
   if (old && old.status !== 'removed') throw new Error(`${name} は既にある (${old.status})。relay send で指示するか relay rm で消す`);
   const { model, permissionMode } = O;
-  const cwd = path.dirname(ROOT); // Worker は repo の作業ツリーで作業する
+  const cwd = path.resolve(O.cwd ?? process.cwd()); // Worker の作業ディレクトリ。既定は spawn を実行したディレクトリ
+  if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`${cwd} はディレクトリではない`);
   // 同じ名前で起こし直した後任でも、前任の会話を relay search で辿れるように transcript は引き継ぐ
   const w = { name, status: 'working', cwd, model, permissionMode, shortId: null, sessionId: null, transcripts: old?.transcripts ?? [], instruction: first(text, 200), lastReport: null, pending: [] };
   save(w);
@@ -217,8 +219,8 @@ function hook(sub, name) {
   log({ worker: name, kind: 'report', text: report, session: w.sessionId, line: `${name} idle: ${first(report, 140)}` });
 }
 
-// statusLine から context の使用率を受け取って記録する。CTX_LIMIT % に達したら、Worker には区切りで報告して引き継ぎを提案
-// させ、Leader には relay wait で知らせる (1 回だけ)。context が膨らんだ Worker は、要約 (compact) の上で作業を続けるより交代させる
+// statusLine から context の使用率を受け取って記録する。CTX_LIMIT % に達したら Leader に relay wait で知らせる (1 回だけ)。
+// 交代させるかどうかは Leader が決める
 const CTX_LIMIT = 70;
 function context(h, name) {
   const pct = h.context_window?.used_percentage;
@@ -228,12 +230,9 @@ function context(h, name) {
   let warn = false;
   update(name, (x) => {
     x.ctx = pct;
-    if (pct >= CTX_LIMIT && !x.ctxWarned) {
-      warn = x.ctxWarned = true;
-      x.pending.push(`context の使用量が ${pct}% に達した。今の作業の区切りで、後任が引き継ぐのに要ること (進み具合・判断したこと・残りの作業) を報告に書いて終える。`);
-    }
+    if (pct >= CTX_LIMIT && !x.ctxWarned) warn = x.ctxWarned = true;
   });
-  if (warn) log({ worker: name, kind: 'context', text: `${pct}%`, line: `${name} context ${pct}%: 区切りで報告させている。後任に交代させる時期` });
+  if (warn) log({ worker: name, kind: 'context', text: `${pct}%`, line: `${name} context ${pct}%` });
 }
 
 // Worker が何かの完了を待っているか (subagent の起動・再開、background のコマンド) を transcript から見る。
@@ -466,7 +465,7 @@ const USAGE = `relay - Leader と Worker の間の proxy と記録装置
 
   relay list                     作業の一覧と引き継ぎ候補
   relay use <作業>               この session を既存の作業に結びつける (Leader の交代)
-  relay spawn <name> "<指示>" [--model m] [--permission-mode p]   Worker を起動 (作業が無ければ作る)
+  relay spawn <name> "<指示>" [--cwd dir] [--model m] [--permission-mode p]   Worker を起動 (作業が無ければ作る)
   relay send <name> "<指示>"     指示を送る (作業中なら次のツール実行の後に渡す)
   relay state                    Worker の状態・指示・報告の要約と notes.md
   relay show <name> [--all]      Worker の詳細 (指示と報告の全文)
@@ -484,10 +483,10 @@ async function main() {
   if (!['list', 'use', 'spawn', 'send', 'state', 'show', 'search', 'wait', 'attach', 'stop', 'rm'].includes(cmd)) return console.log(USAGE);
   if (cmd === 'list') return list();
   if (cmd === 'use') return use(a);
-  if (cmd === 'spawn') { // 記録は repo の中に置くので git から外す (Leader が先に .relay/ を作ることもある)
-    const repo = path.dirname(ROOT);
-    const exclude = path.resolve(repo, git(['rev-parse', '--git-common-dir'], repo), 'info', 'exclude');
-    if (!(fs.existsSync(exclude) ? fs.readFileSync(exclude, 'utf8') : '').split('\n').includes('.relay/')) fs.appendFileSync(exclude, '\n.relay/\n');
+  if (cmd === 'spawn') { // git repo の中なら、記録を git から外す (Leader が先に .relay/ を作ることもある)
+    const repo = path.dirname(ROOT), common = git(['rev-parse', '--git-common-dir'], repo);
+    const exclude = common && path.resolve(repo, common, 'info', 'exclude');
+    if (exclude && !(fs.existsSync(exclude) ? fs.readFileSync(exclude, 'utf8') : '').split('\n').includes('.relay/')) fs.appendFileSync(exclude, '\n.relay/\n');
     if (!DIR) { // 新しい作業。id を振り、この session を結びつける
       const id = randomUUID().slice(0, 8);
       fs.mkdirSync(path.join(ROOT, id), { recursive: true });

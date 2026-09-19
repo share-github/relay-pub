@@ -7,7 +7,6 @@ Leader は指示と判断に集中し、Worker は並行して作業する。指
 
 - Claude Code
 - Node.js 24 以上
-- git repo の中で使う
 
 ## インストール
 
@@ -20,7 +19,7 @@ mkdir -p ~/.claude/skills && ln -s "$PWD" ~/.claude/skills/relay
 ## 使い方
 
 ```sh
-cd /path/to/your/repo
+cd /path/to/your/project
 claude
 ```
 
