@@ -139,9 +139,12 @@ function start(w, text, resume) {
   const out = `${r.stdout}\n${r.stderr}`.replace(/\x1b\[[0-9;]*m/g, ''); // 色の制御文字を除く
   const id = out.match(/backgrounded\s+·\s+([0-9a-f]{8})/)?.[1];
   if (r.status !== 0 || !id) throw new Error(`claude --bg に失敗: ${first(out, 300)}`);
-  if (resume === 'saved' && /started a copy/.test(out)) { // 前の session が終了しきっていない。オプションの無い copy を残さない
+  if (resume === 'saved' && /started a copy/.test(out)) { // オプションの無い copy を残さない
     try { claude(['stop', id]); claude(['rm', id]); } catch { /* 片付け失敗は無視 */ }
-    throw new Error(`${w.name} の前の session がまだ終了中。少し待ってから relay send し直す`);
+    // 前の session が終了しきっていないか、process だけ消えて job の記録が動作中のまま残っている (コンテナの再起動など)。
+    // 記録を消し、フラグ付きで会話を引き継いだ copy を起こす (記録を消した後にフラグ無しで起こすと、hook などの保存したオプションを失う)
+    claude(['rm', w.shortId]);
+    return start(w, text, 'flags');
   }
   return id;
 }
@@ -149,7 +152,8 @@ function start(w, text, resume) {
 function spawnWorker(name, text) {
   if (!name || !text) throw new Error('使い方: relay spawn <name> "<指示>" [--cwd dir] [--model m] [--permission-mode p]');
   const old = load(name);
-  if (old && old.status !== 'removed') throw new Error(`${name} は既にある (${old.status})。relay send で指示するか relay rm で消す`);
+  if (old && !['removed', 'retired'].includes(old.status)) throw new Error(`${name} は既にある (${old.status})。relay send で指示するか relay rm で消す`);
+  if (old?.status === 'retired') stop(name, true); // context 上限で止めた前任を片付けて、同じ名前で後任を起こす
   const { model, permissionMode } = O;
   const cwd = path.resolve(O.cwd ?? process.cwd()); // Worker の作業ディレクトリ。既定は spawn を実行したディレクトリ
   if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`${cwd} はディレクトリではない`);
@@ -167,8 +171,15 @@ function send(name, text) {
   const w = load(name);
   if (!w || w.status === 'removed') throw new Error(`${name} は無い`);
   if (!text) throw new Error('使い方: relay send <name> "<指示>"');
-  log({ worker: name, kind: 'instruct', text });
   const e = agents().get(w.shortId), alive = !!e;
+  if (w.handover) { // context が上限に達した Worker には新しい指示を渡さない
+    if (w.status === 'retired' || e?.status === 'busy' || !w.pending.length) throw new Error(`${name} は context が上限に達したので指示を受け付けない。引き継ぎ報告 (relay show ${name}) を渡して後任を relay spawn する`);
+    // 引き継ぎの指示が届く前に idle になった。指示の代わりにそれを渡す
+    console.log(`${name} は context が上限。指示は渡さず、引き継ぎ報告を書かせる。報告が届いたら後任を relay spawn して渡す`);
+    text = relayMsg(w.pending);
+    update(name, (x) => { x.pending = []; });
+  }
+  log({ worker: name, kind: 'instruct', text });
   if (e?.status === 'busy') {
     // 作業中の session には直接割り込めないので、次のツール実行の後 (PostToolUse) か区切り (Stop) で渡す
     // simplified: 判定と hook の間の競合で次のターンまで残ることがある。relay state の pending で見える
@@ -199,7 +210,7 @@ function hook(sub, name) {
   if (!load(name)) return;
   let msgs = [];
   if (sub === 'tool') { // ツールを 1 回使うたびに、作業中に届いた指示を渡す
-    if (!load(name).pending.length) return; // 大半のツール実行はここで終わる (lock を取らない)
+    if (h.agent_id || !load(name).pending.length) return; // subagent のツール実行では渡さない (subagent が指示を受け取ってしまう)。大半のツール実行はここで終わる (lock を取らない)
     update(name, (x) => { msgs = x.pending.splice(0); });
     if (msgs.length) process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: relayMsg(msgs) } }));
     return;
@@ -212,30 +223,38 @@ function hook(sub, name) {
   // 区切りの返答はすべて報告にする。作業が終わったかどうかは判定しない (Worker が subagent や background の結果を
   // 待っていればその旨の報告になり、結果が届くとまた区切りが来る)。Leader が報告を読んで決める
   const report = h.last_assistant_message ?? '';
+  let retired = false;
   const w = update(name, (x) => {
     seen(x);
     msgs = x.pending.splice(0);
     if (msgs.length) return; // ツールを使わずに区切りまで来た時は、止めずにここで渡す
     x.lastReport = first(report.split('\n').find((l) => /[\p{L}\p{N}]/u.test(l)), 200); // 文字を含む最初の行 (区切り線などを飛ばす)
+    if (x.handover) { retired = true; x.status = 'retired'; } // 引き継ぎの指示の後の区切りが引き継ぎ報告
   });
   if (msgs.length) return process.stdout.write(JSON.stringify({ decision: 'block', reason: relayMsg(msgs) }));
-  log({ worker: name, kind: 'report', text: report, session: w.sessionId, line: `${name} 報告: ${first(report, 140)}` });
+  log({ worker: name, kind: 'report', text: report, session: w.sessionId,
+    line: retired ? `${name} 引き継ぎ報告 (context 上限で止めた。後任を relay spawn して渡す): ${first(report, 140)}` : `${name} 報告: ${first(report, 140)}` });
 }
 
-// statusLine から context の使用率を受け取って記録する。CTX_LIMIT % に達したら Leader に relay wait で知らせる (1 回だけ)。
-// 交代させるかどうかは Leader が決める
-const CTX_LIMIT = 70;
+// statusLine から context の使用量を受け取って記録する。上限 (使用率 CTX_LIMIT % か CTX_TOKENS tokens の早い方) に達したら、
+// Worker に引き継ぎ報告を書かせて止め (指示は pending で渡す)、Leader に relay wait で知らせる。
+// 上限は Leader の判断に任せない: 大きな context の Worker は 1 ターンごとの token 消費が重く、compact の後は質も落ちる
+const CTX_LIMIT = 70, CTX_TOKENS = 250000;
+const HANDOVER = 'context の使用量が上限に達した。今の作業を安全に区切れるところで止め、この session の最後の返答として後任の Worker への引き継ぎ報告を書く: '
+  + '進み具合、変更したもの、判断したことと理由、残りの作業と注意点。新しい作業は始めない。';
 function context(h, name) {
-  const pct = h.context_window?.used_percentage;
-  process.stdout.write(`relay ${name}${pct == null ? '' : ` · context ${pct}%`}`);
-  const w = load(name);
-  if (!w || pct == null || (w.ctx === pct && (pct < CTX_LIMIT || w.ctxWarned))) return; // statusLine は頻繁に呼ばれる。変化が無ければ書かない
+  const pct = h.context_window?.used_percentage, tokens = h.context_window?.total_input_tokens ?? 0;
+  process.stdout.write(`relay ${name}${pct == null ? '' : ` · context ${pct}% (${Math.round(tokens / 1000)}k)`}`);
+  const w = load(name), over = pct >= CTX_LIMIT || tokens >= CTX_TOKENS;
+  if (!w || pct == null || (w.ctx === pct && (w.handover || !over))) return; // statusLine は頻繁に呼ばれる。変化が無ければ書かない
   let warn = false;
   update(name, (x) => {
     x.ctx = pct;
-    if (pct >= CTX_LIMIT && !x.ctxWarned) warn = x.ctxWarned = true;
+    x.ctxTokens = tokens;
+    if (over && !x.handover) { warn = x.handover = true; x.pending.push(HANDOVER); }
   });
-  if (warn) log({ worker: name, kind: 'context', text: `${pct}%`, line: `${name} context ${pct}%` });
+  if (warn) log({ worker: name, kind: 'context', text: `${pct}% ${tokens} tokens`,
+    line: `${name} context ${pct}% (${Math.round(tokens / 1000)}k tokens): 区切りで引き継ぎ報告を書かせて止める。届いたら後任を relay spawn して渡す` });
 }
 
 // 最後のツール実行 (何を待っているのかを Leader に伝える。Bash の timeout は、正常な長時間実行を待つのにも使う)
@@ -269,10 +288,11 @@ function state() {
   const ws = workers().filter((w) => w.status !== 'removed');
   const lines = ws.map((w) => {
     const e = live?.get(w.shortId);
-    const st = w.status !== 'active' ? w.status : !live ? '?'
+    const st = w.status === 'retired' ? 'retired (context 上限。後任を relay spawn して引き継ぎ報告を渡す)' : w.status !== 'active' ? w.status : !live ? '?'
       : !e ? 'session が無い (落ちた可能性。relay send で再開)'
       : e.status === 'waiting' ? `waiting: ${e.waitingFor ?? '?'} (relay attach ${w.name} で応答)` : e.status;
-    return `${w.name} ${st}${w.pending.length ? ` pending ${w.pending.length}` : ''}${w.ctx == null ? '' : ` · context ${w.ctx}%`} · ${ago(w.updatedAt)} 前\n  指示: ${w.instruction}\n  報告: ${w.lastReport ?? '-'}`;
+    const handover = w.handover && w.status === 'active' ? ' · context 上限、引き継ぎ報告待ち' : '';
+    return `${w.name} ${st}${handover}${w.pending.length ? ` pending ${w.pending.length}` : ''}${w.ctx == null ? '' : ` · context ${w.ctx}% (${Math.round((w.ctxTokens ?? 0) / 1000)}k)`} · ${ago(w.updatedAt)} 前\n  指示: ${w.instruction}\n  報告: ${w.lastReport ?? '-'}`;
   });
   const notes = path.join(DIR, 'notes.md');
   console.log(`作業 ${WORK} (管理メモ ${path.relative(process.cwd(), notes)})\n\n${lines.join('\n') || '(Worker なし)'}`);
@@ -363,6 +383,9 @@ function search(q) {
 // 新しい報告か Worker の異常が出るまで待ち、1 行ずつ出して終わる。Leader は background で実行して通知を受ける
 async function wait() {
   const cur = cursorFile();
+  // Leader が `> /dev/null` で捨てると通知が失われる。cursor を進める前に断る (書けなかった時も進めない)
+  const st = fs.fstatSync(1);
+  if (st.isCharacterDevice() && st.rdev === fs.statSync('/dev/null').rdev) throw new Error('出力が /dev/null に捨てられている。relay wait は run_in_background で実行し、出力を捨てない');
   const timeout = Number(O.timeout ?? 1800) * 1000;
   let seen = Number(fs.existsSync(cur) ? fs.readFileSync(cur, 'utf8') : readLog().length);
   const t0 = Date.now();
@@ -370,9 +393,9 @@ async function wait() {
     const all = readLog();
     const lines = all.slice(seen).filter((e) => e.line).map((e) => e.line);
     if (lines.length) {
+      fs.writeSync(1, lines.join('\n') + '\n'); // 閉じた pipe なら投げる
       fs.mkdirSync(path.dirname(cur), { recursive: true });
-      fs.writeFileSync(cur, String(all.length));
-      return console.log(lines.join('\n'));
+      return fs.writeFileSync(cur, String(all.length));
     }
     seen = all.length;
     if (tick % 15 === 14) checkWorkers(); // 落ちた・承認待ちの Worker は Stop を出さないので、一覧も見る

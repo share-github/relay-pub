@@ -35,7 +35,7 @@ description: この session を relay の Leader にする。作業は Worker (�
 | `relay state` | この作業の全 Worker の状態 (busy / idle / waiting)・今の指示・直近の報告の要約と、管理メモ。普段はこれだけ見る |
 | `relay show <name> [--all]` | その Worker への指示と報告の全文 |
 | `relay search <語> [--worker <name>]` | この作業の詳細記録 (指示・報告・Worker と歴代 Leader の会話) を検索 |
-| `relay wait` | **background で実行する** (`run_in_background`)。この作業の Worker の報告や異常が 1 行で届いたら終わるので、確認したらまた background で起動する |
+| `relay wait` | **background で実行する** (`run_in_background`)。この作業の Worker の報告や異常が 1 行で届いたら終わるので、確認したらまた background で起動する。出力を `/dev/null` などに捨てない (捨てると通知が失われるので、relay は断って終わる) |
 | `relay stop <name>` / `relay rm <name>` | 止める / 止めて片付ける |
 
 どのコマンドも、この session が結びついた作業だけを扱う。他の作業の Worker や通知は見えない。
@@ -48,7 +48,8 @@ description: この session を relay の Leader にする。作業は Worker (�
 `relay wait` が出す行: `<name> 報告: <報告の先頭>` (Worker の返答が区切りまで来た。作業が終わったとは限らない。subagent や
 background の結果を待っている時はその旨の報告になり、結果が届くとまた報告が来る)、`<name> dead: …` (session が消えた。`relay send` で再開)、
 `<name> waiting: permission prompt …` (権限の確認で止まっている。人間に `relay attach <name>` で応答してもらう)、
-`<name> context N%` (Worker の context の使用量が 70% に達した。Worker は作業を続けている)、
+`<name> context N% (Nk tokens): …` (Worker の context が上限に達した。relay が Worker に区切りで引き継ぎ報告を書かせて止める)、
+`<name> 引き継ぎ報告 (context 上限で止めた。…): <報告の先頭>` (その報告が届いた。後任を `relay spawn` して渡す)、
 `<name> 反応なし …` (指示の後に報告が無いまま 2 分 30 秒以上、会話記録が伸びていない。background のコマンドや subagent が
 終わらない可能性。止まったままなら 2 分 30 秒ごとに知らせ直す)。
 
@@ -61,10 +62,11 @@ background の結果を待っている時はその旨の報告になり、結果
 
 ## Worker の context
 
-context が膨らんだ Worker は、要約 (compact) の上で作業を続けて質が落ちる。`relay state` に各 Worker の使用量が出る。
-`context N%` の通知が来たら、その Worker に仕上げさせるか、後任の Worker に引き継がせるかを決める。
-引き継がせるなら、区切りで進み具合・判断したこと・残りの作業を報告させ、前任を `relay stop` し、後任を `relay spawn` して
-前任の報告・判断を渡す (前任の記録は `relay search` で辿れる)。新しい作業は、長く使った Worker に `relay send` するより、新しい Worker に任せる。
+context が膨らんだ Worker は、1 ターンごとの token 消費が重く、要約 (compact) の後は質も落ちる。`relay state` に各 Worker の使用量が出る。
+上限 (使用率 70% か 250k tokens の早い方) に達すると、relay が Worker に区切りで引き継ぎ報告 (進み具合・判断・残りの作業) を
+書かせて止める (状態 `retired`)。その Worker への `relay send` は断られる。`引き継ぎ報告` の通知が来たら、後任を `relay spawn`
+して報告の全文 (`relay show <name>`) と残りの作業を渡す。同じ名前で `relay spawn` すると前任は片付けられ、前任の会話は
+`relay search` で辿れる。新しい作業は、長く使った Worker に `relay send` するより、新しい Worker に任せる。
 
 ## 管理メモ
 
