@@ -1,7 +1,7 @@
 # relay
 
 Claude Code の 1 つの session を Leader にして、作業を複数の Worker (background の Claude Code session) に任せるためのツール。
-Leader は指示と判断に集中し、Worker はそれぞれ専用の git worktree で並行して作業する。指示と報告は記録され、Leader が交代しても続きから進められる。
+Leader は指示と判断に集中し、Worker は並行して作業する。指示と報告は記録され、Leader が交代しても続きから進められる。
 
 ## 必要なもの
 

@@ -30,22 +30,20 @@ description: この session を relay の Leader にする。作業は Worker (�
 |---|---|
 | `relay list` | 作業の一覧と引き継ぎ候補 |
 | `relay use <作業>` | この session を既存の作業に結びつける (人間が引き継ぎを承認した時だけ) |
-| `relay spawn <name> "<指示>" [--model m] [--permission-mode p]` | Worker を起動する。専用の git worktree で作業する。人間が model や権限モードを指定していれば、後任を含めて毎回付ける |
+| `relay spawn <name> "<指示>" [--model m] [--permission-mode p]` | Worker を起動する。人間が model や権限モードを指定していれば、後任を含めて毎回付ける |
 | `relay send <name> "<指示>"` | 次の指示・追加・変更・中止の指示。作業中なら、Worker が次にツールを使い終えた時に渡る (1 回のツール実行が長いとその間は待つ)。今すぐ止めるなら `relay stop <name>` の後に `relay send` で指示する (同じ session で文脈を保ったまま再開する) |
 | `relay state` | この作業の全 Worker の状態・今の指示・直近の報告の要約と、管理メモ。普段はこれだけ見る |
 | `relay show <name> [--all]` | その Worker への指示と報告の全文 |
 | `relay search <語> [--worker <name>]` | この作業の詳細記録 (指示・報告・Worker と歴代 Leader の会話) を検索 |
 | `relay wait` | **background で実行する** (`run_in_background`)。この作業の Worker の報告や異常が 1 行で届いたら終わるので、確認したらまた background で起動する |
-| `relay stop <name>` / `relay rm <name>` | 止める / 止めて worktree を片付ける (branch は残る) |
+| `relay stop <name>` / `relay rm <name>` | 止める / 止めて片付ける |
 
 どのコマンドも、この session が結びついた作業だけを扱う。他の作業の Worker や通知は見えない。
 
 ## Worker の作業場所
 
-- `relay spawn` は、今の checkout の HEAD commit から worktree `.relay/<作業>/wt/<name>` と branch `relay/<作業>/<name>` を作る。
-  未 commit の変更は Worker に見えない。同じ名前の branch が既にあれば、それを使う。
-- worktree は同じ repo を共有するので、Worker は他の Worker の branch を merge・checkout できる (`git merge relay/<作業>/<name>`)。
-- worktree は repo の checkout なので、repo の CLAUDE.md や `.claude/` もそのまま入っている。
+- Worker は repo の作業ツリーで作業する。Leader と全 Worker が同じファイルを見るので、未 commit の変更も互いに見える。
+- 同時に動かす Worker には同じファイルを編集させない (互いの変更を上書きする)。branch の切り替えや commit も全員に及ぶ。
 - `.relay/` は relay が `.git/info/exclude` に足すので、git status に出ない。
 
 `relay wait` が出す行: `<name> idle: <報告の先頭>` (作業が終わった)、`<name> dead: …` (session が消えた。`relay send` で再開)、
@@ -65,7 +63,7 @@ description: この session を relay の Leader にする。作業は Worker (�
 
 context が膨らんだ Worker は、要約 (compact) の上で作業を続けて質が落ちる。`relay state` に各 Worker の使用量が出る。
 `context N%` の通知が来たら、その Worker の報告を待ち、残りの作業を後任の Worker に引き継がせる
-(前任を `relay stop` し、後任を `relay spawn` して、前任の branch・報告・判断を渡す。前任の記録は `relay search` で辿れる)。
+(前任を `relay stop` し、後任を `relay spawn` して、前任の報告・判断を渡す。前任の記録は `relay search` で辿れる)。
 残りがごく少ないなら、そのまま仕上げさせてもよい。新しい作業は、長く使った Worker に `relay send` するより、新しい Worker に任せる。
 
 ## 管理メモ
@@ -77,8 +75,3 @@ context が膨らんだ Worker は、要約 (compact) の上で作業を続け�
 ## 交代した時
 
 `relay state` を読んで現状をつかむ。経緯が足りなければ `relay search` で前任の Leader や Worker の会話を調べる。
-
-## 統合
-
-Worker は各自の branch に commit する。merge・競合の解消・統合後のテストも Worker に任せ、
-Leader は統合の順序と方針を決める。

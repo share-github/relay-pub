@@ -148,20 +148,14 @@ function spawnWorker(name, text) {
   const old = load(name);
   if (old && old.status !== 'removed') throw new Error(`${name} は既にある (${old.status})。relay send で指示するか relay rm で消す`);
   const { model, permissionMode } = O;
-  const repo = path.dirname(ROOT);
-  // Worker は専用の worktree で作業する (同じ作業ツリーでの同時編集を避ける)。branch は作業ごとに分ける
-  const cwd = path.join(DIR, 'wt', name), branch = `relay/${WORK}/${name}`;
-  if (!fs.existsSync(cwd)) {
-    const exists = spawnSync('git', ['rev-parse', '--verify', '--quiet', branch], { cwd: repo }).status === 0;
-    git(['worktree', 'add', ...(exists ? [cwd, branch] : ['-b', branch, cwd])], repo);
-  }
+  const cwd = path.dirname(ROOT); // Worker は repo の作業ツリーで作業する
   // 同じ名前で起こし直した後任でも、前任の会話を relay search で辿れるように transcript は引き継ぐ
-  const w = { name, status: 'working', cwd, branch, model, permissionMode, shortId: null, sessionId: null, transcripts: old?.transcripts ?? [], instruction: first(text, 200), lastReport: null, pending: [] };
+  const w = { name, status: 'working', cwd, model, permissionMode, shortId: null, sessionId: null, transcripts: old?.transcripts ?? [], instruction: first(text, 200), lastReport: null, pending: [] };
   save(w);
   log({ worker: name, kind: 'instruct', text });
   w.shortId = start(w, text, false);
   update(name, (x) => { x.shortId = w.shortId; }); // 起動中に hook が書いた session id を消さない
-  console.log(`${name} を起動した (claude attach ${w.shortId}) worktree ${path.relative(repo, cwd)} branch ${branch}`);
+  console.log(`${name} を起動した (claude attach ${w.shortId})`);
 }
 
 // ---- Leader → Worker ----
@@ -236,7 +230,7 @@ function context(h, name) {
     x.ctx = pct;
     if (pct >= CTX_LIMIT && !x.ctxWarned) {
       warn = x.ctxWarned = true;
-      x.pending.push(`context の使用量が ${pct}% に達した。今の作業の区切りで commit し、後任が引き継ぐのに要ること (進み具合・判断したこと・残りの作業) を報告に書いて終える。`);
+      x.pending.push(`context の使用量が ${pct}% に達した。今の作業の区切りで、後任が引き継ぐのに要ること (進み具合・判断したこと・残りの作業) を報告に書いて終える。`);
     }
   });
   if (warn) log({ worker: name, kind: 'context', text: `${pct}%`, line: `${name} context ${pct}%: 区切りで報告させている。後任に交代させる時期` });
@@ -461,21 +455,18 @@ function stop(name, remove) {
   const w = load(name);
   if (!w) throw new Error(`${name} は無い`);
   try { stopAndWait(w.shortId); } catch { /* 既に止まっている */ } // 直後の send で copy にならないよう終了まで待つ
-  if (remove) {
-    try { claude(['rm', w.shortId]); } catch { /* 既に無い */ }
-    if (w.branch && fs.existsSync(w.cwd)) spawnSync('git', ['worktree', 'remove', '--force', w.cwd], { cwd: path.dirname(ROOT) });
-  }
+  if (remove) try { claude(['rm', w.shortId]); } catch { /* 既に無い */ }
   const status = remove ? 'removed' : 'stopped';
   update(name, (x) => { x.status = status; });
   log({ worker: name, kind: status, text: '' });
-  console.log(`${name} ${status}${remove && w.branch ? ` (branch ${w.branch} は残した)` : ''}`);
+  console.log(`${name} ${status}`);
 }
 
 const USAGE = `relay - Leader と Worker の間の proxy と記録装置
 
   relay list                     作業の一覧と引き継ぎ候補
   relay use <作業>               この session を既存の作業に結びつける (Leader の交代)
-  relay spawn <name> "<指示>" [--model m] [--permission-mode p]   Worker を専用 worktree で起動 (作業が無ければ作る)
+  relay spawn <name> "<指示>" [--model m] [--permission-mode p]   Worker を起動 (作業が無ければ作る)
   relay send <name> "<指示>"     指示を送る (作業中なら次のツール実行の後に渡す)
   relay state                    Worker の状態・指示・報告の要約と notes.md
   relay show <name> [--all]      Worker の詳細 (指示と報告の全文)
@@ -493,7 +484,7 @@ async function main() {
   if (!['list', 'use', 'spawn', 'send', 'state', 'show', 'search', 'wait', 'attach', 'stop', 'rm'].includes(cmd)) return console.log(USAGE);
   if (cmd === 'list') return list();
   if (cmd === 'use') return use(a);
-  if (cmd === 'spawn') { // 記録と worktree は repo の中に置くので git から外す (Leader が先に .relay/ を作ることもある)
+  if (cmd === 'spawn') { // 記録は repo の中に置くので git から外す (Leader が先に .relay/ を作ることもある)
     const repo = path.dirname(ROOT);
     const exclude = path.resolve(repo, git(['rev-parse', '--git-common-dir'], repo), 'info', 'exclude');
     if (!(fs.existsSync(exclude) ? fs.readFileSync(exclude, 'utf8') : '').split('\n').includes('.relay/')) fs.appendFileSync(exclude, '\n.relay/\n');
