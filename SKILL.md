@@ -50,7 +50,7 @@ context の上限機構が無く、膨らむと要約で細部を失うので、
 | `relay state` | この作業の全 Worker の状態 (busy / idle / waiting)・今の指示・直近の報告の要約と、管理メモ。普段はこれだけ見る |
 | `relay show <name> [--all]` | その Worker への指示と報告の全文 |
 | `relay search <語> [--worker <name>]` | この作業の詳細記録 (指示・報告・Worker と歴代 Leader の会話) を検索 |
-| `relay wait` | **background で実行する** (`run_in_background`)。この作業の Worker の報告や異常が 1 行で届いたら終わるので、確認したらまた background で起動する。出力を `/dev/null` などに捨てない (捨てると通知が失われるので、relay は断って終わる) |
+| `relay wait` | **background で実行する** (`run_in_background`)。この作業の Worker の報告や異常が 1 行で届いたら終わるので、確認したらまた background で起動する (30 分の `(変化なし)` の後も同じ)。Worker が動いている間に wait を起動せずにターンを終えようとすると、Stop hook が止めて起動を求める。出力を `/dev/null` などに捨てない (捨てると通知が失われるので、relay は断って終わる) |
 | `relay stop <name>` / `relay rm <name>` | 止める / 止めて片付ける |
 
 どのコマンドも、この session が結びついた作業だけを扱う。他の作業の Worker や通知は見えない。

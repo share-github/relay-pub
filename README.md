@@ -16,6 +16,17 @@ chmod +x relay.js && ln -s "$PWD/relay.js" ~/bin/relay      # ~/bin は PATH の
 mkdir -p ~/.claude/skills && ln -s "$PWD" ~/.claude/skills/relay
 ```
 
+`~/.claude/settings.json` に Leader の Stop hook を足す (`/path/to/relay` は clone した場所)。Leader が `relay wait` を起動せずに
+ターンを終えるのを止める。Worker が動いていない session では何もしない。
+
+```json
+{
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command", "command": "/path/to/relay/relay.js _leader" }] }]
+  }
+}
+```
+
 ## 使い方
 
 ```sh

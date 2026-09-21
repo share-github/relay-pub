@@ -107,11 +107,12 @@ const agents = () => new Map(JSON.parse(claude(['agents', '--json'])).filter((e)
 // 動いている session を --resume すると copy ができるので、止めてから再開する。
 // claude stop の後もプロセスはしばらく終了処理を続け、その間の --resume は copy になるので、プロセスが消えるまで待つ。
 // 止められなかった時は投げる (止まっていない Worker を stopped と記録しない)
+const alivePid = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 function stopAndWait(id) {
   const pid = JSON.parse(claude(['agents', '--json'])).find((e) => e.id === id)?.pid;
   if (!pid) return; // 動いていない
   claude(['stop', id]);
-  const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const alive = () => alivePid(pid);
   for (let i = 0; i < 60 && alive(); i++) spawnSync('sleep', ['0.5']);
   if (alive()) throw new Error(`session ${id} が 30 秒経っても終了しない`);
 }
@@ -169,6 +170,9 @@ function spawnWorker(name, text) {
   w.shortId = start(w, text, false);
   update(name, (x) => { x.shortId = w.shortId; }); // 起動中に hook が書いた session id を消さない
   console.log(`${name} を起動した (claude attach ${w.shortId})`);
+  const settings = ['settings.json', 'settings.local.json'].flatMap((f) => [path.join(os.homedir(), '.claude', f), path.join(process.cwd(), '.claude', f)]);
+  if (!settings.some((f) => { try { return fs.readFileSync(f, 'utf8').includes('_leader'); } catch { return false; } }))
+    console.log('Leader の Stop hook (relay _leader) が settings.json に無い。relay wait の起動し忘れを止められない (README を見る)');
 }
 
 // ---- Leader → Worker ----
@@ -399,22 +403,48 @@ async function wait() {
   // Leader が `> /dev/null` で捨てると通知が失われる。cursor を進める前に断る (書けなかった時も進めない)
   const st = fs.fstatSync(1);
   if (st.isCharacterDevice() && st.rdev === fs.statSync('/dev/null').rdev) throw new Error('出力が /dev/null に捨てられている。relay wait は run_in_background で実行し、出力を捨てない');
+  if (waitAlive(SID)) return console.log('relay wait は既に動いている (同じ通知を 2 回受けないよう、1 つの session に 1 つだけ動かす)');
+  fs.mkdirSync(path.dirname(waitFile(SID)), { recursive: true });
+  fs.writeFileSync(waitFile(SID), String(process.pid)); // Leader の Stop hook (leaderStop) が生存を見る
   const timeout = Number(O.timeout ?? 1800) * 1000;
   let seen = Number(fs.existsSync(cur) ? fs.readFileSync(cur, 'utf8') : readLog().length);
   const t0 = Date.now();
-  for (let tick = 0; Date.now() - t0 < timeout; tick++) {
-    const all = readLog();
-    const lines = all.slice(seen).filter((e) => e.line).map((e) => e.line);
-    if (lines.length) {
-      fs.writeSync(1, lines.join('\n') + '\n'); // 閉じた pipe なら投げる
-      fs.mkdirSync(path.dirname(cur), { recursive: true });
-      return fs.writeFileSync(cur, String(all.length));
+  try {
+    for (let tick = 0; Date.now() - t0 < timeout; tick++) {
+      const all = readLog();
+      const lines = all.slice(seen).filter((e) => e.line).map((e) => e.line);
+      if (lines.length) {
+        fs.writeSync(1, lines.join('\n') + '\n'); // 閉じた pipe なら投げる
+        fs.mkdirSync(path.dirname(cur), { recursive: true });
+        return fs.writeFileSync(cur, String(all.length));
+      }
+      seen = all.length;
+      if (tick % 15 === 14) checkWorkers(); // 落ちた・承認待ちの Worker は Stop を出さないので、一覧も見る
+      await new Promise((r) => setTimeout(r, 1000));
     }
-    seen = all.length;
-    if (tick % 15 === 14) checkWorkers(); // 落ちた・承認待ちの Worker は Stop を出さないので、一覧も見る
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-  console.log('(変化なし)');
+    console.log('(変化なし)');
+  } finally { fs.rmSync(waitFile(SID), { force: true }); }
+}
+// 動いている relay wait の pid。Leader の session ごとに 1 つ
+const waitFile = (sid) => path.join(DIR, 'wait', sid ?? 'default');
+const waitAlive = (sid) => { try { return alivePid(Number(fs.readFileSync(waitFile(sid), 'utf8'))); } catch { return false; } };
+
+// ---- Leader の Stop hook (人間の settings.json に置く。README) ----
+// Leader を起こせるのは background の relay wait の終了だけなので、wait を起動し忘れると Worker の報告が来ても Leader は
+// 気づかない (通知は log に残り、後の wait で届く)。起動は Leader の判断に任せず、wait が動いていなければターンを終えさせない
+function leaderStop() {
+  const h = JSON.parse(fs.readFileSync(0, 'utf8') || '{}');
+  const sid = h.session_id;
+  let id; try { id = fs.readFileSync(path.join(ROOT, 'sessions', sid), 'utf8').trim(); } catch { return; } // Leader でない session (Worker や他の作業)
+  setWork(id);
+  const m = leadersOf(id); // 後任が付いた作業の前任には要求しない (要求すると 30 分ごとに起きて token を使う)
+  if (Object.keys(m).sort((a, b) => Date.parse(m[a]) - Date.parse(m[b])).at(-1) !== sid) return;
+  if (!workers().some((w) => w.status === 'active')) return; // 通知を出す Worker が無い
+  if (waitAlive(sid)) return;
+  nap(500); // run_in_background で起動した直後は pid がまだ書かれていない
+  // simplified: 1 回止めても起動しなければ通す (relay が使えない環境で止め続けると token を浪費する)
+  if (waitAlive(sid) || h.stop_hook_active) return;
+  process.stdout.write(JSON.stringify({ decision: 'block', reason: '[relay] relay wait が動いていない。Worker の報告で起きられるよう、relay wait を run_in_background で起動してから終える' }));
 }
 // Worker の最後の動き。relay 自身の書き込み (updatedAt) では進んだことにならないので、transcript が伸びた時刻を見る
 // 前面のコマンドは既定 120 秒で background に移される (Worker は作業を続ける) ので、指示の後に報告が無いまま 2 分 30 秒
@@ -488,6 +518,7 @@ const USAGE = `relay - Leader と Worker の間の proxy と記録装置
 async function main() {
   const [cmd, a, ...rest] = argv;
   if (cmd === '_hook') return hook(a, rest[0]);
+  if (cmd === '_leader') return leaderStop();
   if (!['list', 'use', 'spawn', 'send', 'state', 'show', 'search', 'wait', 'attach', 'stop', 'rm'].includes(cmd)) return console.log(USAGE);
   if (cmd === 'list') return list();
   if (cmd === 'use') return use(a);
